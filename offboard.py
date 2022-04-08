@@ -108,18 +108,28 @@ class MavrosOffboardPosctl(object):
 
     def depth_callback(self, data):
         # points_list = []
-        print("hello")
-
-        xyz_array = ros_numpy.point_cloud2.pointcloud2_to_xyz_array(data)
-
+        xyz_array = ros_numpy.point_cloud2.pointcloud2_to_array(data)
+    
         points_list = xyz_array
+        print(points_list.shape)
+        print(type(points_list))
+        print(points_list[240,320])
 
-        points_list_mod = points_list.reshape(480, 640, 3)
+        points_list_mod = points_list
+        # points_list_mod = points_list.reshape(480, 640, 3)
 
-        center_points = points_list_mod[0:320, 213:426, :]
-        center_points_dist = np.linalg.norm(center_points)
+        # center_points = points_list_mod[0:320, 213:426][0:3]
+        # print(center_points)
+        # print(center_points.shape)
 
-        print(points_list_mod)
+        center_point = points_list[240,320]
+        center_point = np.asarray([center_point['x'], center_point['y'], center_point['z']])
+        print(center_point)
+
+        center_point_dist = np.linalg.norm(center_point)
+
+        if center_point_dist < 1.5:
+            self.altitude = 2
 
 
         # find_goal = Find_pos_goal(self.centerRed, self.drone_pose_x, self.drone_pose_y, self.drone_pose_z, points_list_mod)
