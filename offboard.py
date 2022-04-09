@@ -21,6 +21,7 @@ class MavrosOffboardPosctl(object):
         self.extended_state = ExtendedState()
         self.imu_data = Imu()
         self.local_position = PoseStamped()
+        self.local_position_old = PoseStamped()
         self.state = State()
         self.rover_pos = PointStamped()
 
@@ -66,6 +67,19 @@ class MavrosOffboardPosctl(object):
         self.pos = PoseStamped()
         self.radius = 0.1
         self.altitude = 0.5
+        self.direction = [0,0]
+        self.rover_timer = 0
+        self.x_inc = 0
+        self.y_inc = 0
+        self.yaw_inc = 0
+        self.p_goal = [0,0]
+        self.yaw = 0
+        self.yaw_deg = 90
+        self.roof_timer = 0
+        self.on_roof = False
+        self.roof_stage = 0
+        self.roof_check = 0
+        self.local_pos_timer = 0
 
         self.pos_setpoint_pub = rospy.Publisher(
             'mavros/setpoint_position/local', PoseStamped, queue_size=1)
@@ -89,51 +103,238 @@ class MavrosOffboardPosctl(object):
         drone = np.array([
             self.local_position.pose.position.x,
             self.local_position.pose.position.y])
+        self.drone = drone
 
         rover = np.array([
             self.rover_pos.point.x,
             self.rover_pos.point.y])
+        self.rover = rover
 
         direction = rover - drone
         direction /= np.linalg.norm(direction)
 
         d_separation = 1.0
-        altitude = self.altitude
         
-        p_goal = rover - direction*d_separation
-
-        yaw = np.arctan2(direction[1], direction[0])
+        if self.roof_stage == 0:
+            self.p_goal = rover - direction*d_separation
+            self.yaw = np.arctan2(direction[1], direction[0])
       
-        self.goto_position(x=p_goal[0], y=p_goal[1], z=altitude, yaw_deg=np.rad2deg(yaw))
+        # OLD
+        # self.goto_position(x=p_goal[0], y=p_goal[1], z=altitude, yaw_deg=(np.rad2deg(yaw) + self.yaw_inc))
+
+        # Reset rover find timer when found rover
+        self.rover_timer = 0
+        self.x_inc = 0
+        self.y_inc = 0
+        self.yaw_inc = 0
+
+        
 
     def depth_callback(self, data):
         # points_list = []
-        xyz_array = ros_numpy.point_cloud2.pointcloud2_to_array(data)
+        # points_array = ros_numpy.point_cloud2.pointcloud2_to_array(data)
     
-        points_list = xyz_array
-        print(points_list.shape)
-        print(type(points_list))
-        print(points_list[240,320])
+        # xyz_array = ros_numpy.point_cloud2.get_xyz_points(points_array, remove_nans=True)
 
-        points_list_mod = points_list
+        xyz_array = ros_numpy.point_cloud2.pointcloud2_to_xyz_array(data, remove_nans=False)
+
         # points_list_mod = points_list.reshape(480, 640, 3)
 
         # center_points = points_list_mod[0:320, 213:426][0:3]
         # print(center_points)
         # print(center_points.shape)
 
-        center_point = points_list[240,320]
-        center_point = np.asarray([center_point['x'], center_point['y'], center_point['z']])
-        print(center_point)
+        center_col = xyz_array[220:260,:,:]
 
-        center_point_dist = np.linalg.norm(center_point)
+        center_col_dist = np.linalg.norm(center_col, axis=2)
+        center_col_dist = center_col_dist[~np.isnan(center_col_dist)]
+        if center_col_dist.size == 0:
+            center_col_dist = np.nan
 
-        if center_point_dist < 1.5:
-            self.altitude = 2
+        alt_max = 5
+        move_mult = 1
+        wait_ticks = 30
+
+        
+        print(self.roof_stage)
+        print(np.min(center_col_dist))
+
+        # Attempt legend:
+        # Attempt number 1 - pooly organized adaptable script
+        # Attempt number 2 - better organized adaptable script
+        # Attempt number 3 - everything hardcoded (built off attempt number 2 framework)
+
+        # ATTEMPT NUMBER 3 (Hard coded values)
+        # Roof stages
+        if self.roof_stage == 0:    # Check for obstacle
+            # print(any(center_col_dist < 0.8))
+            if np.min(center_col_dist) < 0.5:
+                # Calculate direction drone was moving
+                drone = np.array([
+                    self.local_position.pose.position.x,
+                    self.local_position.pose.position.y])
+                drone_old = np.array([
+                    self.local_position_old.pose.position.x,
+                    self.local_position_old.pose.position.y])
+                direction = drone - drone_old
+                self.direction = direction / np.linalg.norm(direction)
+
+                self.roof_stage += 1
+
+        elif self.roof_stage == 1:  # Make sure object not a fluke
+            # print(any(center_col_dist < 0.9))
+            if np.min(center_col_dist) < 0.9:
+                self.roof_check += 1
+                self.p_goal = self.drone
+                self.x_inc = 0
+                self.y_inc = 0
+            else:
+                self.roof_stage = 0
+                self.roof_check = 0
+
+            if self.roof_check > 10:
+                self.roof_stage += 1
+                self.roof_check = 0
+
+        elif self.roof_stage == 2:  # Fly up
+            self.altitude = 1.5
+            self.roof_stage += 1
+
+        elif self.roof_stage == 3:  # Wait a moment
+            self.roof_timer += 1
+            if self.roof_timer > wait_ticks:
+                self.roof_stage += 1
+                self.roof_timer = 0
+
+        elif self.roof_stage == 4:  # Fly over obstacle
+            self.x_inc = 0
+            self.y_inc = 2
+            self.roof_stage += 1
+
+        elif self.roof_stage == 5:  # Wait a moment
+            self.roof_timer += 1
+            if self.roof_timer > wait_ticks:
+                self.roof_stage += 1
+
+        elif self.roof_stage == 6:  # Fly back down
+            # if self.altitude > 0.5:
+            #     self.altitude -= 0.02*move_mult
+            # else:
+            #     self.roof_stage = 0
+            self.altitude = 0.5
+            self.roof_stage = 0
+            self.roof_timer = 0
+            self.p_goal += np.array([self.x_inc, self.y_inc])
+            self.x_inc = 0
+            self.y_inc = 0
 
 
-        # find_goal = Find_pos_goal(self.centerRed, self.drone_pose_x, self.drone_pose_y, self.drone_pose_z, points_list_mod)
-        # pose = find_goal.pos_goal()
+        # # ATTEMPT NUMBER 2
+        # # Roof stages
+        # if self.roof_stage == 0:    # Check for obstacle
+        #     # print(any(center_col_dist < 0.8))
+        #     if np.min(center_col_dist) < 0.5:
+        #         # Calculate direction drone was moving
+        #         drone = np.array([
+        #             self.local_position.pose.position.x,
+        #             self.local_position.pose.position.y])
+        #         drone_old = np.array([
+        #             self.local_position_old.pose.position.x,
+        #             self.local_position_old.pose.position.y])
+        #         direction = drone - drone_old
+        #         self.direction = direction / np.linalg.norm(direction)
+
+        #         self.roof_stage += 1
+
+        # elif self.roof_stage == 1:  # Make sure object not a fluke
+        #     # print(any(center_col_dist < 0.9))
+        #     if np.min(center_col_dist) < 0.9:
+        #         self.roof_check += 1
+        #         self.p_goal = self.drone
+        #         self.x_inc = 0
+        #         self.y_inc = 0
+        #     else:
+        #         self.roof_stage = 0
+        #         self.roof_check = 0
+
+        #     if self.roof_check > 10:
+        #         self.roof_stage += 1
+        #         self.roof_check = 0
+
+        # elif self.roof_stage == 2:  # Fly up
+        #     #print(any(center_col_dist < 1))
+        #     if np.min(center_col_dist) < 1:
+        #         self.altitude += 0.05*move_mult
+        #     else:
+        #         self.roof_stage += 1
+
+        # elif self.roof_stage == 3:  # Wait a moment
+        #     self.roof_timer += 1
+        #     if self.roof_timer > wait_ticks:
+        #         self.roof_stage += 1
+
+        # elif self.roof_stage == 4:  # Fly over obstacle
+        #     # print(self.direction)
+        #     self.x_inc += 0.2*self.direction[0]*move_mult
+        #     self.y_inc += 0.2*self.direction[1]*move_mult
+        #     # self.x_inc += 0
+        #     # self.y_inc += 0.1*move_mult
+
+        #     #print(any(center_col_dist < 3))
+        #     if np.min(center_col_dist) < 2:
+        #         self.roof_timer = 0
+        #     else:
+        #         self.roof_timer += 1
+
+        #     if self.roof_timer > 30:
+        #         self.roof_stage += 1
+        #         self.roof_timer = 0
+
+        # elif self.roof_stage == 5:  # Wait a moment
+        #     self.roof_timer += 1
+        #     if self.roof_timer > wait_ticks:
+        #         self.roof_stage += 1
+
+        # elif self.roof_stage == 6:  # Fly back down
+        #     # if self.altitude > 0.5:
+        #     #     self.altitude -= 0.02*move_mult
+        #     # else:
+        #     #     self.roof_stage = 0
+        #     self.altitude = 0.5
+        #     self.roof_stage = 0
+
+
+        # # ATTEMPT NUMBER 1
+        # if any(center_col_dist < 1):
+        #     self.on_roof = True
+        #     self.p_goal = self.rover
+
+        #     if any(center_col_dist < 0.5) and (self.altitude < alt_max):
+        #         self.altitude += 0.1
+        #     else:
+        #         self.x_inc += self.direction[0]*move_mult
+        #         self.y_inc += self.direction[1]*move_mult
+
+        #     self.roof_timer += 1
+
+        # elif self.on_roof == True and self.roof_timer > 10:
+        #     self.on_roof = False
+        #     self.roof_timer = 0
+
+        # if self.on_roof == False and self.altitude > 0.55:
+        #     self.altitude -= 0.01
+        #     # self.roof_timer = 0
+
+        # Increment rover timer
+        self.rover_timer += 1
+
+        # Initiate search mode when cannot find rover
+        if (self.rover_timer > 10 and self.roof_stage == 0):
+            self.yaw_inc = np.mod(self.yaw_inc + 5, 360)
+        # print(self.rover_timer)
+
+        # Send pos commands to drone
+        self.goto_position(x=(self.p_goal[0] + self.x_inc), y=(self.p_goal[1] + self.y_inc), z=self.altitude, yaw_deg=(np.rad2deg(self.yaw) + self.yaw_inc))
 
     def extended_state_callback(self, data: ExtendedState):
         if self.extended_state.vtol_state != data.vtol_state:
@@ -160,6 +361,10 @@ class MavrosOffboardPosctl(object):
             self.sub_topics_ready['imu'] = True
 
     def local_position_callback(self, data: PoseStamped):
+        if self.local_pos_timer > 10:
+            self.local_position_old = self.local_position
+            self.local_pos_timer = 0
+            print("saving old position...")
         self.local_position = data
 
         if not self.sub_topics_ready['local_pos']:
